@@ -69,7 +69,7 @@ class CreativeDecisionRating:
             db,
             df_ratings[["typical_end_x", "typical_end_y"]].rename(
                 columns={"typical_end_x": "end_x", "typical_end_y": "end_y"}
-            ),
+            ),#when calculating features, apply_overrides overrides the data in the sql database to a prespecified value
         )
         df_ratings["typical_p_success"] = self.pass_success_component.predict(
             feat_typical_pass_succes
@@ -98,4 +98,4 @@ class CreativeDecisionRating:
             feat_typical_pass_value_fail
         )
 
-        return df_ratings
+        return df_ratings#can then use typical_value_success/fail, selection_odds, and typical_p_success to get selection criteria

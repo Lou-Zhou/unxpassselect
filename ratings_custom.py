@@ -25,7 +25,7 @@ class LocationPredictions:
     def __init__(
         self,
         pass_selection_component: pass_selection.SoccerMapComponent,
-        pass_success_component: pass_success.XGBoostComponent,
+        pass_success_component: pass_success.SoccerMapComponent,
         pass_value_success_component: pass_selection.SoccerMapComponent,
         pass_value_fail_component: pass_selection.SoccerMapComponent
     ):
@@ -33,77 +33,81 @@ class LocationPredictions:
         self.pass_selection_component = pass_selection_component
         self.pass_success_component = pass_success_component
         self.pass_value_fail_component = pass_value_fail_component
-    def get_all(self, db, dataset: Callable, game_id, action_id):
-        pass_selection_surface = self.pass_selection_component.predict_surface(dataset)
-        surface_action = pass_selection_surface[game_id][action_id]
-        x_lim, y_lim = surface_action.shape
-        coords = list(itertools.product(range(0,x_lim), range(0,y_lim)))
-        base = 0
-        limit = self.pass_success_component.initialize_dataset(dataset).features.shape[0]
-        og_limit = limit
-        all_ratings = []
-        while base < len(coords):
-            print(base, limit)
-            #ratings, surface = self.rate(db, dataset, game_id, action_id, base, limit, coords, x_lim, y_lim, surface_action)
-            ratings = self.rate(db, dataset, game_id, action_id, base, limit, coords, x_lim, y_lim, surface_action)
-            base = base + og_limit
-            limit = limit + og_limit
-            all_ratings.append(ratings)
-        all_locations= pd.concat(all_ratings)
-        return all_locations
-    def rate(self, db, dataset: Callable, game_id, action_id, base, limit, coords, x_lim ,y_lim, surface):
-        data = dataset(
-            xfns={
-                "startlocation": ["start_x_a0", "start_y_a0"],
-                "endlocation": ["end_x_a0", "end_y_a0"],
-            },
-            yfns=["success"],
-        )
         
-        data_pass_success = self.pass_success_component.initialize_dataset(dataset)
-        test_db = db.actions(game_id = game_id)
-        if limit > len(coords):
-            num_options = len(coords) - base
-        else:
-            num_options  = data_pass_success.features.shape[0]
-        df_override = pd.DataFrame([test_db.loc[(game_id, action_id)]] * num_options)
-        df_override["coord_x"] = [i[0] for i in coords][base:limit]
-        df_override["coord_y"] = [i[1] for i in coords][base:limit]
+    def rate_all_games(self, db, dataset, summarize = True, custom_pass = None):
+        print("Generating Surfaces:")
+        pass_selection_surface = self.pass_selection_component.predict_surface(dataset, db = db)
+        pass_success_surface = self.pass_success_component.predict_surface(dataset,db = db)
+        pass_value_surface_success = self.pass_value_success_component.predict_surface(dataset, db = db)
+        pass_value_surface_fail = self.pass_value_fail_component.predict_surface(dataset, db = db)
+        print("Finished.")
+        alldf = []
+        sels = self.pass_selection_component.predict(dataset)#ensuring that the actual pass made is in the dataset
+        value_fail =self.pass_value_fail_component.predict(dataset)
+        success = self.pass_success_component.predict(dataset)
+        value_success = self.pass_value_success_component.predict(dataset)
+        all_ratings = pd.concat([sels, success, value_success, value_fail], axis=1).rename(columns = {0:"selection_probability", 1: "success_probability", 2:"value_success", 3:"value_fail" })
+        for game in pass_selection_surface:
+            game_preds = all_ratings.loc[game]
+            ending_coords = db.actions(game_id = game)[["end_x", "end_y"]].loc[game]
+            game_ogs = pd.concat([game_preds,ending_coords], axis = 1).dropna()
+            for action in pass_selection_surface[game]:
+                if custom_pass is not None:
+                    game = custom_pass["game_id"]
+                    action = custom_pass["action_id"]
+                print(game, action)
+                true_ends = db.actions(game_id = game).loc[(game,action)][["end_x","end_y"]]
+                
+                metrics = self.rate(game, action, pass_selection_surface, pass_success_surface, pass_value_surface_success, pass_value_surface_fail, db)
+                metrics["Dist_From_True"] = (metrics["end_x"] - true_ends["end_x"])**2 + (metrics["end_y"] - true_ends["end_y"])**2
+                closest_idx = np.where(metrics["Dist_From_True"] == min(metrics["Dist_From_True"]))[0]#getting closest pass to actual pass and then replacing that one with the original pass
+                metrics = metrics.reset_index(drop = True)
+                cols = ["end_x", "end_y", "selection_probability", "success_probability", "value_success", "value_fail"]
+                metrics["True_Location"] = 0
+                for col in cols:
+                    metrics[col][closest_idx[0]] = game_ogs[col].loc[action]
+                metrics["selection_probability"] = np.float64(metrics["selection_probability"])
+                metrics["True_Location"][closest_idx[0]] = 1
+                metrics["Expected_Utility"] = (metrics["success_probability"] * metrics["value_success"]) + ((1 - metrics["success_probability"]) * metrics["value_fail"])
+                metrics["Utility*P(Selection)"] = metrics["selection_probability"] * metrics["Expected_Utility"]
+                
+                metrics["Sum(l')"] = sum(metrics["Utility*P(Selection)"]) - metrics["Utility*P(Selection)"]
+                
+                metrics["subSelCriteria"] = np.float64(metrics["selection_probability"]) * (metrics["Expected_Utility"] - metrics["Sum(l')"])**2
+                metrics["Selection_Criteria"] = sum(metrics["subSelCriteria"])
+                metrics = metrics.sort_values(by = ["subSelCriteria"], ascending = False)
+                metrics["Evaluation_Criteria"] = metrics["True_Location"] * (metrics["Expected_Utility"]  - metrics["Sum(l')"])
+                
+                metrics = metrics.drop(columns = ["Dist_From_True"])
+                if summarize:
+                    metrics = metrics[metrics["True_Location"] == 1]
+                    metrics = metrics[["original_event_id", "game_id", "action_id", "start_x","start_y", "end_x", "end_y", "result_id", "Selection_Criteria", "Evaluation_Criteria"]]
+                if custom_pass is not None:
+                    return metrics
+                alldf.append(metrics)
+            
+        combined = pd.concat(alldf)
+        return combined
+    def rate(self, game, action, selection, success, value_success, value_fail, db):
+        game_selection = selection[game][action]
+        game_success = success[game][action]
+        game_value_success = value_success[game][action]
+        game_value_fail = value_fail[game][action]
+        x_lim, y_lim = game_selection.shape
+        coords = list(itertools.product(range(0,x_lim), range(0,y_lim)))
+        test_db = db.actions(game_id = game)
+
+        df_override = pd.DataFrame([test_db.loc[(game, action)]] * len(coords))
+        df_override["game_id"] = game
+        df_override["action_id"] = action
+        df_override["coord_x"] = [i[0] for i in coords]
+        df_override["coord_y"] = [i[1] for i in coords]
         df_override["end_x"] = convert_x(df_override["coord_x"], x_lim)
         df_override["end_y"] = convert_y(df_override["coord_y"], y_lim)
-        df_override.index = data_pass_success.features.head(num_options).index
-        df_override["true_game_id"] = game_id 
-        df_override["true_action_id"] = action_id
-        feat_typical_pass_success = data_pass_success.apply_overrides(
-            db,
-            df_override
-            )
+        df_override["selection_probability"] = game_selection[df_override["coord_x"], df_override["coord_y"]]
+        df_override["success_probability"] = game_success[df_override["coord_x"], df_override["coord_y"]]
+        df_override["value_success"] = game_value_success[df_override["coord_x"], df_override["coord_y"]]
+        df_override["value_fail"] = game_value_fail[df_override["coord_x"], df_override["coord_y"]]
         
-        feat_typical_pass_success.limit_dataset(num_options)
-        df_override["pass_success"] = self.pass_success_component.predict(
-             feat_typical_pass_success
-        )
-        data_pass_value = self.pass_value_success_component.initialize_dataset(dataset)
-        feat_typical_pass_value_success = data_pass_value.apply_overrides(
-            db,
-            df_override,
-            )
-        feat_typical_pass_value_success.limit_dataset(num_options)
-        #feat_typical_pass_value_success.labels["success"] = False
-        #return feat_typical_pass_value_success.features
-        df_override["typical_value_success"] = self.pass_value_success_component.new_predict(
-            feat_typical_pass_value_success
-            )
-        #return feat_typical_pass_value_success.labels, df_override["typical_value_success"]
-        feat_typical_pass_value_fail = data_pass_value.apply_overrides(
-        db,
-        df_override,
-        )
-        #feat_typical_pass_value_fail.labels["success"] = True
-        feat_typical_pass_value_fail.limit_dataset(num_options)
-        df_override["typical_value_fail"] = self.pass_value_fail_component.new_predict(
-        feat_typical_pass_value_fail
-            )
-        df_override["selection_probability"] = surface[df_override["coord_x"], df_override["coord_y"]]
         return df_override
     

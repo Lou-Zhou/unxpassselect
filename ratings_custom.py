@@ -1,3 +1,7 @@
+"""
+Disregard this file
+"""
+
 from typing import Callable
 from socceraction.spadl.utils import add_names
 import numpy as np
